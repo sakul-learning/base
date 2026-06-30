@@ -1,6 +1,7 @@
 package test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,9 +12,11 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/lambda"
 	"github.com/aws/aws-sdk-go-v2/service/sns/types"
 	terratestaws "github.com/gruntwork-io/terratest/modules/aws"
 	loggers "github.com/gruntwork-io/terratest/modules/logger"
+	"github.com/gruntwork-io/terratest/modules/retry"
 	"github.com/gruntwork-io/terratest/modules/terraform"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -270,6 +273,117 @@ func TestSnsUrl(t *testing.T) {
 	// test_structure.RunTestStage(t, "validate", func() {
 	// 	validate(t, tfWorkingDir, awsRegion)
 	// })
+}
+
+// Test the sqs-poller-config app. Do not run this by default in this PR; it
+// deploys Lambda event source mappings and drives sustained SQS load so it
+// should be reviewed before execution.
+func TestSqsProvisionedPollerConfig(t *testing.T) {
+	envVars := executors.EnvMap(os.Environ())
+	runNotifyIntegrationTest(t, "sqs-poller-config", "us-east-1", envVars, validateSqsProvisionedPollerConfig)
+}
+
+func validateSqsProvisionedPollerConfig(t *testing.T, tfDir, awsRegion string) {
+	terraformOptions := test_structure.LoadTerraformOptions(t, tfDir)
+
+	maximumOnlyMappingID := terraform.Output(t, terraformOptions, "MaximumOnlyEventSourceMappingId")
+	minimumOnlyMappingID := terraform.Output(t, terraformOptions, "MinimumOnlyEventSourceMappingId")
+	bothMappingID := terraform.Output(t, terraformOptions, "BothEventSourceMappingId")
+	loadMappingID := terraform.Output(t, terraformOptions, "LoadEventSourceMappingId")
+	loadQueueUrl := util.LoadOutputAttribute(t, terraformOptions, "load_queue", "url")
+	loadFunctionName := util.LoadOutputAttribute(t, terraformOptions, "load_function", "name")
+
+	// Port of the AWS CDK integ assertions:
+	// - only maximumPollers set => AWS applies SQS minimum default 2
+	// - only minimumPollers set => AWS applies SQS maximum default 200
+	// - both set => AWS returns both configured values
+	assertProvisionedPollerConfig(t, awsRegion, maximumOnlyMappingID, 2, 1000)
+	assertProvisionedPollerConfig(t, awsRegion, minimumOnlyMappingID, 3, 200)
+	assertProvisionedPollerConfig(t, awsRegion, bothMappingID, 3, 1000)
+
+	// Active validation for the dedicated load mapping. Lambda does not expose the
+	// instantaneous poller count, so this validates both the control-plane config
+	// and that a mapping configured with provisioned pollers drains sustained SQS
+	// load successfully.
+	assertProvisionedPollerConfig(t, awsRegion, loadMappingID, 2, 10)
+
+	messageCount := envInt("SQS_POLLER_LOAD_MESSAGE_COUNT", 500)
+	sendSqsLoad(t, awsRegion, loadQueueUrl, messageCount)
+	waitForQueueToDrain(t, awsRegion, loadQueueUrl, 5*time.Minute)
+
+	logGroup := fmt.Sprintf("/aws/lambda/%s", loadFunctionName)
+	messages := util.WaitForLogEvents(t, awsRegion, logGroup, 36, 5*time.Second)
+	assert.Contains(t, strings.Join(messages, "\n"), "sqs-poller-load-batch")
+}
+
+func assertProvisionedPollerConfig(t *testing.T, awsRegion, eventSourceMappingID string, expectedMin, expectedMax int32) {
+	client, err := terratestaws.NewLambdaClientE(t, awsRegion)
+	require.NoError(t, err)
+
+	description := fmt.Sprintf("Waiting for event source mapping %s to report provisioned poller config", eventSourceMappingID)
+	_, err = retry.DoWithRetryE(t, description, 30, 10*time.Second, func() (string, error) {
+		mapping, err := client.GetEventSourceMapping(context.Background(), &lambda.GetEventSourceMappingInput{
+			UUID: aws.String(eventSourceMappingID),
+		})
+		if err != nil {
+			return "", err
+		}
+		if mapping.State != nil && *mapping.State != "Enabled" {
+			return "", fmt.Errorf("event source mapping state is %s", *mapping.State)
+		}
+		if mapping.ProvisionedPollerConfig == nil {
+			return "", fmt.Errorf("provisioned poller config is nil")
+		}
+
+		actualMin := aws.ToInt32(mapping.ProvisionedPollerConfig.MinimumPollers)
+		actualMax := aws.ToInt32(mapping.ProvisionedPollerConfig.MaximumPollers)
+		if actualMin != expectedMin || actualMax != expectedMax {
+			return "", fmt.Errorf("expected pollers min=%d max=%d, got min=%d max=%d", expectedMin, expectedMax, actualMin, actualMax)
+		}
+		return fmt.Sprintf("provisioned pollers min=%d max=%d", actualMin, actualMax), nil
+	})
+	require.NoError(t, err)
+}
+
+func sendSqsLoad(t *testing.T, awsRegion, queueUrl string, messageCount int) {
+	terratestLogger.Logf(t, "Sending %d SQS messages to provisioned-poller load queue", messageCount)
+	for i := 0; i < messageCount; i++ {
+		terratestaws.SendMessageToQueue(t, awsRegion, queueUrl, fmt.Sprintf("sqs-poller-load-%04d", i))
+	}
+}
+
+func waitForQueueToDrain(t *testing.T, awsRegion, queueUrl string, timeout time.Duration) {
+	description := fmt.Sprintf("Waiting for queue %s to drain", queueUrl)
+	maxRetries := int(timeout / (10 * time.Second))
+	_, err := retry.DoWithRetryE(t, description, maxRetries, 10*time.Second, func() (string, error) {
+		attrs := util.GetQueueAttributes(t, awsRegion, queueUrl)
+		visible, err := strconv.Atoi(attrs["ApproximateNumberOfMessages"])
+		if err != nil {
+			return "", err
+		}
+		notVisible, err := strconv.Atoi(attrs["ApproximateNumberOfMessagesNotVisible"])
+		if err != nil {
+			return "", err
+		}
+		remaining := visible + notVisible
+		if remaining == 0 {
+			return "queue drained", nil
+		}
+		return "", fmt.Errorf("queue still has %d visible and %d in-flight messages", visible, notVisible)
+	})
+	require.NoError(t, err)
+}
+
+func envInt(name string, defaultValue int) int {
+	value := os.Getenv(name)
+	if value == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return defaultValue
+	}
+	return parsed
 }
 
 func validateQueue(t *testing.T, workingDir string, awsRegion string) {

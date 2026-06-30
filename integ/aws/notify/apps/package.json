@@ -10,7 +10,8 @@
     "sns": "bun run ./sns.ts",
     "sns-lambda": "bun run ./sns-lambda.ts",
     "sns-sqs": "bun run ./sns-sqs.ts",
-    "sns-url": "bun run ./sns-url.ts"
+    "sns-url": "bun run ./sns-url.ts",
+    "sqs-poller-config": "bun run ./sqs-poller-config.ts"
   },
   "dependencies": {
     "cdktn": "^0.23.0",

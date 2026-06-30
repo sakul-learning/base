@@ -47,3 +47,7 @@ sns-sqs: ## Test SNS integration with sqs
 sns-url: ## Test SNS URL subscription integration app
 	go test -v -timeout 30m ./... -run ^TestSnsUrl$
 .PHONY: sns-url
+
+sqs-poller-config: ## Test SQS Lambda event source provisioned poller config
+	go test -v -timeout 30m ./... -run ^TestSqsProvisionedPollerConfig$
+.PHONY: sqs-poller-config
